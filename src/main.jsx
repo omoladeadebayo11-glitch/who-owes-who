@@ -44,20 +44,32 @@ function App(){
   const[data,setData]=useState(loadLocal);
   const[page,setPage]=useState('home');
   const[session,setSession]=useState(null);
+  const[authReady,setAuthReady]=useState(!supabase);
   const[cloudBusy,setCloudBusy]=useState(false);
   const[toast,setToast]=useState('');
-  const group=data.groups.find(g=>g.id===data.activeGroupId)||data.groups[0];
+  const group=data.groups.find(g=>g.id===data.activeGroupId)||data.groups[0]||fresh().groups[0];
   const calc=useMemo(()=>calculate(group),[group]);
   const person=id=>group.people.find(p=>p.id===id)?.name||'Unknown';
   const openExpenses=group.expenses.filter(e=>(calc.openByExpense[e.id]||0)>.009);
-  const settledExpenses=group.expenses.filter(e=>!(calc.openByExpense[e.id]>0.009));
 
-  useEffect(()=>localStorage.setItem('wow-v2',JSON.stringify(data)),[data]);
-  useEffect(()=>{if(!supabase)return;supabase.auth.getSession().then(({data})=>setSession(data.session));const{data:s}=supabase.auth.onAuthStateChange((_e,s)=>setSession(s));return()=>s.subscription.unsubscribe()},[]);
+  // Signed-out work belongs to this browser only. Signed-in work is loaded from Supabase.
+  useEffect(()=>{if(authReady&&!session)localStorage.setItem('wow-v2',JSON.stringify(data))},[data,session,authReady]);
+  useEffect(()=>{
+    if(!supabase)return;
+    supabase.auth.getSession().then(({data:a})=>{setSession(a.session);setAuthReady(true)});
+    const{data:listener}=supabase.auth.onAuthStateChange((_event,next)=>{setSession(next);setAuthReady(true)});
+    return()=>listener.subscription.unsubscribe();
+  },[]);
+  useEffect(()=>{
+    if(!authReady)return;
+    if(session){loadCloudWorkspace(true)}
+    else{setData(loadLocal());setPage('home')}
+  },[authReady,session?.user?.id]);
   useEffect(()=>{if(!toast)return;const t=setTimeout(()=>setToast(''),2400);return()=>clearTimeout(t)},[toast]);
   useEffect(()=>{
     if(!data.settings.reminders||!('Notification'in window))return;
-    const debt=calc.net.find(x=>x.from==='me');
+    const myPerson=group.people.find(p=>p.linked)||group.people.find(p=>p.id==='me');
+    const debt=myPerson&&calc.net.find(x=>x.from===myPerson.id);
     if(!debt)return;
     const key=`wow-reminded-${today()}`;
     if(localStorage.getItem(key))return;
@@ -66,34 +78,96 @@ function App(){
     const delay=Math.max(1000,target-now);
     const timer=setTimeout(()=>{if(Notification.permission==='granted'){new Notification('Who Owes Who?',{body:`You still owe ${person(debt.to)} ${money(debt.amount)}.`});localStorage.setItem(key,'1')}},delay);
     return()=>clearTimeout(timer);
-  },[data.settings,calc.net]);
+  },[data.settings,calc.net,group.people]);
 
-  const patchGroup=fn=>setData(d=>({...d,groups:d.groups.map(g=>g.id===d.activeGroupId?fn(g):g)}));
   const go=p=>{setPage(p);window.scrollTo({top:0,behavior:'smooth'})};
 
-  async function cloudSync(){
-    if(!supabase||!session){setToast('Sign in first to use cloud sync.');go('account');return}
+  async function fetchCloudGroups(){
+    const{data:members,error}=await supabase.from('group_members').select('group_id,display_name,role,groups(id,name,invite_code,created_at)').eq('user_id',session.user.id);
+    if(error)throw error;
+    const groups=[];
+    for(const m of members||[]){
+      const gid=m.group_id;
+      const[{data:people,error:pe},{data:expenses,error:ee},{data:em,error:eme},{data:payments,error:pae}]=await Promise.all([
+        supabase.from('people').select('*').eq('group_id',gid).order('created_at'),
+        supabase.from('expenses').select('*').eq('group_id',gid).order('expense_date',{ascending:false}),
+        supabase.from('expense_members').select('expense_id,person_id'),
+        supabase.from('payments').select('*').eq('group_id',gid).order('payment_date',{ascending:false})
+      ]);
+      if(pe||ee||eme||pae)throw(pe||ee||eme||pae);
+      groups.push({id:gid,name:m.groups.name,inviteCode:m.groups.invite_code,people:(people||[]).map(p=>({id:p.id,name:p.name,linked:p.linked_user_id===session.user.id})),expenses:(expenses||[]).map(e=>({id:e.id,title:e.title,amount:Number(e.amount),date:e.expense_date,payer:e.payer_person_id,members:(em||[]).filter(x=>x.expense_id===e.id).map(x=>x.person_id)})),payments:(payments||[]).map(p=>({id:p.id,from:p.from_person_id,to:p.to_person_id,amount:Number(p.amount),date:p.payment_date,note:p.note||'',status:p.status}))});
+    }
+    return groups;
+  }
+
+  async function loadCloudWorkspace(createIfEmpty=false){
+    if(!supabase||!session)return;
     setCloudBusy(true);
     try{
-      const{data:members,error:me}=await supabase.from('group_members').select('group_id,display_name,role,groups(id,name,invite_code,created_at)').eq('user_id',session.user.id);
-      if(me)throw me;
-      if(!members?.length){setToast('Create or join a cloud group first.');go('account');return}
-      const groups=[];
-      for(const m of members){
-        const gid=m.group_id;
-        const[{data:people},{data:expenses},{data:em},{data:payments}]=await Promise.all([
-          supabase.from('people').select('*').eq('group_id',gid),
-          supabase.from('expenses').select('*').eq('group_id',gid).order('expense_date',{ascending:false}),
-          supabase.from('expense_members').select('expense_id,person_id'),
-          supabase.from('payments').select('*').eq('group_id',gid).order('payment_date',{ascending:false})
-        ]);
-        groups.push({id:gid,name:m.groups.name,inviteCode:m.groups.invite_code,people:(people||[]).map(p=>({id:p.id,name:p.name,linked:!!p.linked_user_id})),expenses:(expenses||[]).map(e=>({id:e.id,title:e.title,amount:Number(e.amount),date:e.expense_date,payer:e.payer_person_id,members:(em||[]).filter(x=>x.expense_id===e.id).map(x=>x.person_id)})),payments:(payments||[]).map(p=>({id:p.id,from:p.from_person_id,to:p.to_person_id,amount:Number(p.amount),date:p.payment_date,note:p.note||'',status:p.status}))});
+      let groups=await fetchCloudGroups();
+      if(!groups.length&&createIfEmpty){
+        const display=session.user.user_metadata?.display_name||'You';
+        const{error}=await supabase.rpc('create_group_with_me',{group_name:'My Group',my_name:display});
+        if(error)throw error;
+        groups=await fetchCloudGroups();
       }
-      setData(d=>({...d,groups,activeGroupId:groups.some(g=>g.id===d.activeGroupId)?d.activeGroupId:groups[0].id}));
-      setToast('Cloud data synced.');
+      if(groups.length)setData(d=>({version:2,groups,activeGroupId:groups.some(g=>g.id===d.activeGroupId)?d.activeGroupId:groups[0].id,settings:d.settings||fresh().settings}));
+      setToast('Cloud workspace loaded.');
     }catch(e){setToast(e.message||'Cloud sync failed.')}finally{setCloudBusy(false)}
   }
 
+  async function persistCloudGroup(next,prev){
+    if(!supabase||!session)return;
+    try{
+      if(next.name!==prev.name){const{error}=await supabase.from('groups').update({name:next.name}).eq('id',next.id);if(error)throw error}
+      const peopleRows=next.people.map(p=>({id:p.id,group_id:next.id,linked_user_id:p.linked?session.user.id:null,name:p.name}));
+      if(peopleRows.length){const{error}=await supabase.from('people').upsert(peopleRows);if(error)throw error}
+      const removedPeople=prev.people.filter(p=>!next.people.some(x=>x.id===p.id)).map(p=>p.id);
+      if(removedPeople.length){const{error}=await supabase.from('people').delete().in('id',removedPeople);if(error)throw error}
+
+      const expRows=next.expenses.map(e=>({id:e.id,group_id:next.id,title:e.title,amount:e.amount,expense_date:e.date,payer_person_id:e.payer,created_by:session.user.id}));
+      if(expRows.length){const{error}=await supabase.from('expenses').upsert(expRows);if(error)throw error}
+      const removedExp=prev.expenses.filter(e=>!next.expenses.some(x=>x.id===e.id)).map(e=>e.id);
+      if(removedExp.length){const{error}=await supabase.from('expenses').delete().in('id',removedExp);if(error)throw error}
+      for(const e of next.expenses){
+        const{error:de}=await supabase.from('expense_members').delete().eq('expense_id',e.id);if(de)throw de;
+        if(e.members.length){const{error:ie}=await supabase.from('expense_members').insert(e.members.map(pid=>({expense_id:e.id,person_id:pid})));if(ie)throw ie}
+      }
+
+      const payRows=next.payments.map(p=>({id:p.id,group_id:next.id,from_person_id:p.from,to_person_id:p.to,amount:p.amount,payment_date:p.date,note:p.note||'',status:p.status||'confirmed',created_by:session.user.id}));
+      if(payRows.length){const{error}=await supabase.from('payments').upsert(payRows);if(error)throw error}
+      const removedPay=prev.payments.filter(p=>!next.payments.some(x=>x.id===p.id)).map(p=>p.id);
+      if(removedPay.length){const{error}=await supabase.from('payments').delete().in('id',removedPay);if(error)throw error}
+    }catch(e){setToast(`Cloud save failed: ${e.message}`);loadCloudWorkspace(false)}
+  }
+
+  const patchGroup=fn=>setData(d=>{
+    const prev=d.groups.find(g=>g.id===d.activeGroupId);if(!prev)return d;
+    const next=fn(prev);
+    if(session)persistCloudGroup(next,prev);
+    return{...d,groups:d.groups.map(g=>g.id===d.activeGroupId?next:g)};
+  });
+
+  async function importLocalWorkspace(){
+    if(!session)return;
+    const local=loadLocal(),src=local.groups.find(g=>g.id===local.activeGroupId)||local.groups[0];
+    const hasWork=src&&(src.expenses.length||src.payments.length||src.people.length>1||src.name!=='My Group');
+    if(!hasWork)return setToast('There is no local work to import.');
+    if(!confirm('Copy your signed-out local expenses into this cloud account? Your local copy will stay on this device too.'))return;
+    setCloudBusy(true);
+    try{
+      const current=data.groups.find(g=>g.id===data.activeGroupId);
+      const me=current.people.find(p=>p.linked)||current.people[0];
+      const idMap={};
+      const localMe=src.people.find(p=>p.id==='me')||src.people[0];idMap[localMe.id]=me.id;
+      const added=[];
+      for(const p of src.people.filter(p=>p.id!==localMe.id)){const id=uid();idMap[p.id]=id;added.push({id,name:p.name,linked:false})}
+      const migrated={...current,name:src.name||current.name,people:[me,...added],expenses:src.expenses.map(e=>({id:uid(),title:e.title,amount:e.amount,date:e.date,payer:idMap[e.payer],members:e.members.map(x=>idMap[x]).filter(Boolean)})),payments:src.payments.map(p=>({id:uid(),from:idMap[p.from],to:idMap[p.to],amount:p.amount,date:p.date,note:p.note,status:p.status||'confirmed'})).filter(p=>p.from&&p.to)};
+      await persistCloudGroup(migrated,current);setData(d=>({...d,groups:d.groups.map(g=>g.id===current.id?migrated:g)}));setToast('Local workspace copied to your account.');
+    }catch(e){setToast(e.message||'Import failed.')}finally{setCloudBusy(false)}
+  }
+
+  if(!authReady)return <div className="app"><section className="card notice"><Cloud/><b>Loading your workspace…</b></section></div>;
   return <div className="app">
     {toast&&<div className="toast">{toast}</div>}
     <header>
@@ -106,26 +180,21 @@ function App(){
       <section className="hero"><span>GROUP BALANCE</span><strong>{calc.net.length?`${calc.net.length} balance${calc.net.length>1?'s':''} to settle`:'All settled up'}</strong><p>{group.people.length} people · {openExpenses.length} unsettled bill{openExpenses.length===1?'':'s'}</p></section>
       <div className="grid"><button className="action primary" onClick={()=>go('add')}><Plus/><b>Add expense</b><span>Split a new bill</span></button><button className="action" onClick={()=>go('people')}><Users/><b>People</b><span>Manage group</span></button></div>
       <div className="quick"><button onClick={()=>go('history')}><History/> History</button><button onClick={()=>go('settings')}><Settings/> Settings</button></div>
-
       <h2>Who owes who?</h2>
       <section className="card">{calc.net.length?calc.net.map(s=><button className="settle" key={`${s.from}-${s.to}`} onClick={()=>go(`debt:${s.from}:${s.to}`)}><div><b>{person(s.from)}</b><span> owes </span><b>{person(s.to)}</b></div><strong>{money(s.amount)}</strong><ChevronRight/></button>):<div className="empty"><CheckCircle2/><b>Nobody owes anything</b><span>Everything is settled.</span></div>}</section>
-
       <div className="titleRow"><h2>Unsettled expenses</h2><ReceiptText/></div>
       <section className="card">{openExpenses.length?openExpenses.map(e=><ExpenseRow key={e.id} e={e} person={person} outstanding={calc.openByExpense[e.id]} onClick={()=>go(`expense:${e.id}`)}/>):<div className="empty compact"><WalletCards/><b>No unsettled expenses</b><span>Paid bills move to History.</span></div>}</section>
     </>}
-
-    {page==='add'&&<ExpenseForm group={group} patchGroup={patchGroup} onDone={()=>go('home')} setToast={setToast}/>}
-    {page==='people'&&<People group={group} patchGroup={patchGroup} setToast={setToast}/>}
-    {page==='history'&&<HistoryPage group={group} calc={calc} person={person}/>}
-    {page==='settings'&&<SettingsPage data={data} setData={setData} group={group} patchGroup={patchGroup} setToast={setToast}/>}
-    {page==='account'&&<AccountPage supabase={supabase} session={session} cloudBusy={cloudBusy} cloudSync={cloudSync} setToast={setToast}/>}
-    {page.startsWith('debt:')&&<DebtPage page={page} group={group} calc={calc} person={person} patchGroup={patchGroup} setToast={setToast} onDone={()=>go('home')}/>}
-    {page.startsWith('expense:')&&<ExpenseDetail page={page} group={group} patchGroup={patchGroup} person={person} setToast={setToast} onDone={()=>go('home')}/>}
-
-    <footer>WHO OWES WHO? · {session?'cloud account connected':'local demo mode'}</footer>
+    {page==='add'&&<ExpenseForm group={group} patchGroup={patchGroup} onDone={()=>go('home')} setToast={setToast}/>} 
+    {page==='people'&&<People group={group} patchGroup={patchGroup} setToast={setToast}/>} 
+    {page==='history'&&<HistoryPage group={group} calc={calc} person={person}/>} 
+    {page==='settings'&&<SettingsPage data={data} setData={setData} group={group} patchGroup={patchGroup} setToast={setToast}/>} 
+    {page==='account'&&<AccountPage supabase={supabase} session={session} cloudBusy={cloudBusy} cloudSync={()=>loadCloudWorkspace(false)} importLocalWorkspace={importLocalWorkspace} setToast={setToast}/>} 
+    {page.startsWith('debt:')&&<DebtPage page={page} group={group} calc={calc} person={person} patchGroup={patchGroup} setToast={setToast} onDone={()=>go('home')}/>} 
+    {page.startsWith('expense:')&&<ExpenseDetail page={page} group={group} patchGroup={patchGroup} person={person} setToast={setToast} onDone={()=>go('home')}/>} 
+    <footer>WHO OWES WHO? · {session?'cloud account connected':'local device workspace'}</footer>
   </div>
 }
-
 function ExpenseRow({e,person,outstanding,onClick}){
   return <button className="expense" onClick={onClick}><div className="receipt">₦</div><div className="grow"><b>{e.title}</b><span>{person(e.payer)} paid · {fmtDate(e.date)} · split {e.members.length} ways</span></div><div className="amountStack"><strong>{money(e.amount)}</strong>{outstanding>0&&<small>{money(outstanding)} open</small>}</div><ChevronRight/></button>
 }
@@ -191,14 +260,14 @@ function SettingsPage({data,setData,group,patchGroup,setToast}){
   return <><h2>Group</h2><section className="card form"><label>GROUP NAME<input value={name} onChange={e=>setName(e.target.value)}/></label><button className="submit" onClick={()=>{const n=name.trim();if(!n)return;patchGroup(g=>({...g,name:n}));setToast('Group renamed.')}}><Save/> Save group name</button>{group.inviteCode&&group.inviteCode!=='LOCAL'&&<div className="invite"><span>Invite code</span><b>{group.inviteCode}</b><button onClick={()=>navigator.clipboard?.writeText(group.inviteCode)}><Copy/></button></div>}</section><h2>Debt reminders</h2><section className="card form"><div className="switchRow"><div><b>Daily reminder</b><span>Remind me while I still owe someone.</span></div><button className={data.settings.reminders?'switch on':'switch'} onClick={toggleReminder}><i/></button></div><label>REMINDER TIME<input type="time" value={data.settings.reminderTime} onChange={e=>setData(d=>({...d,settings:{...d.settings,reminderTime:e.target.value}}))}/></label><p className="hint">Browser notifications work while the browser can run this app. Reliable closed-app push reminders need the hosted push service in a later deployment step.</p></section></>
 }
 
-function AccountPage({supabase,session,cloudBusy,cloudSync,setToast}){
+function AccountPage({supabase,session,cloudBusy,cloudSync,importLocalWorkspace,setToast}){
   const[email,setEmail]=useState(''),[password,setPassword]=useState(''),[name,setName]=useState('You'),[groupName,setGroupName]=useState('My Group'),[code,setCode]=useState('');
   if(!supabase)return <><h2>Account & cloud</h2><section className="card notice"><CloudOff/><b>Local Demo Mode</b><p>The app is fully testable on this device. To enable sign-in, cross-device records and shared groups, add your Supabase URL and anon key to the project environment.</p><code>VITE_SUPABASE_URL<br/>VITE_SUPABASE_ANON_KEY</code><p>Run the included <b>supabase-schema.sql</b> once in Supabase.</p></section></>;
   async function signUp(){const{error}=await supabase.auth.signUp({email,password,options:{data:{display_name:name}}});setToast(error?error.message:'Account created. Check your email if confirmation is enabled.')}
   async function signIn(){const{error}=await supabase.auth.signInWithPassword({email,password});setToast(error?error.message:'Signed in.')}
   async function createGroup(){const{error}=await supabase.rpc('create_group_with_me',{group_name:groupName,my_name:name});if(error)return setToast(error.message);setToast('Cloud group created.');cloudSync()}
   async function join(){const{error}=await supabase.rpc('join_group_by_code',{code,my_name:name});if(error)return setToast(error.message);setToast('Group joined.');cloudSync()}
-  if(session)return <><h2>Account & cloud</h2><section className="card notice"><Cloud/><b>{session.user.email}</b><p>Your account is connected. Sync loads your shared cloud groups and records.</p><button className="submit" disabled={cloudBusy} onClick={cloudSync}>{cloudBusy?'Syncing…':'Sync cloud data'}</button><button className="ghost" onClick={()=>supabase.auth.signOut()}>Sign out</button></section><h2>Create shared group</h2><section className="card form"><label>YOUR DISPLAY NAME<input value={name} onChange={e=>setName(e.target.value)}/></label><label>GROUP NAME<input value={groupName} onChange={e=>setGroupName(e.target.value)}/></label><button className="submit" onClick={createGroup}><Users/> Create group</button></section><h2>Join with invite code</h2><section className="card form"><label>INVITE CODE<input value={code} onChange={e=>setCode(e.target.value.toUpperCase())}/></label><button className="submit" onClick={join}><UserPlus/> Join group</button></section></>;
+  if(session)return <><h2>Account & cloud</h2><section className="card notice"><Cloud/><b>{session.user.email}</b><p>Your account is connected. Sync loads your shared cloud groups and records.</p><button className="submit" disabled={cloudBusy} onClick={cloudSync}>{cloudBusy?'Syncing…':'Sync cloud data'}</button><button className="ghost" disabled={cloudBusy} onClick={importLocalWorkspace}>Import signed-out local expenses</button><button className="ghost" onClick={()=>supabase.auth.signOut()}>Sign out</button></section><h2>Create shared group</h2><section className="card form"><label>YOUR DISPLAY NAME<input value={name} onChange={e=>setName(e.target.value)}/></label><label>GROUP NAME<input value={groupName} onChange={e=>setGroupName(e.target.value)}/></label><button className="submit" onClick={createGroup}><Users/> Create group</button></section><h2>Join with invite code</h2><section className="card form"><label>INVITE CODE<input value={code} onChange={e=>setCode(e.target.value.toUpperCase())}/></label><button className="submit" onClick={join}><UserPlus/> Join group</button></section></>;
   return <><h2>Sign in</h2><section className="card form"><label>DISPLAY NAME<input value={name} onChange={e=>setName(e.target.value)}/></label><label>EMAIL<input type="email" value={email} onChange={e=>setEmail(e.target.value)}/></label><label>PASSWORD<input type="password" minLength="6" value={password} onChange={e=>setPassword(e.target.value)}/></label><div className="twoButtons"><button type="button" className="submit" onClick={signIn}><LogIn/> Sign in</button><button type="button" className="ghost" onClick={signUp}>Create account</button></div></section></>
 }
 
