@@ -1,39 +1,28 @@
-# Who Owes Who? V2
+# Who Owes Who? V2.1
 
-A mobile-first shared expense and debt tracker.
+Mobile-first Nigerian Naira expense splitter built with React + Vite.
 
-## V2 includes
-- Editable groups and people
-- Dated expenses
-- Persistent unsettled bills + settled history
-- Running and net balances per person
-- Full and partial settlements
-- Payment history
-- Expense edit/delete
-- Amount validation
-- Daily reminder settings
-- Optional Supabase email authentication and cloud sync
-- Shared-group invite codes (cloud mode)
+## V2.1 account/cloud behavior
+- Signed-out mode keeps a local workspace on that browser/device.
+- Each signed-in Supabase account loads only groups that account belongs to.
+- New accounts automatically receive a fresh cloud group.
+- Expense, people, payment, settlement and group-name changes save to Supabase while signed in.
+- Signing out restores the separate signed-out local workspace.
+- A signed-in user can optionally copy their old signed-out local workspace into the current cloud group.
+- Shared groups remain shared through Supabase group membership/invite codes.
 
-## Preview locally / StackBlitz
+## Supabase
+Run `supabase-schema.sql` in the Supabase SQL Editor, then provide:
 
+```env
+VITE_SUPABASE_URL=...
+VITE_SUPABASE_ANON_KEY=...
+```
+
+The value used for `VITE_SUPABASE_ANON_KEY` can be the browser-safe Supabase publishable key.
+
+## Run
 ```bash
 npm install
 npm run dev
 ```
-
-Without Supabase environment variables the app runs in **Local Demo Mode** and saves to localStorage.
-
-## Enable accounts + cloud sync
-
-1. Create a Supabase project.
-2. Run `supabase-schema.sql` in Supabase SQL Editor.
-3. Add `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` to your environment.
-4. Restart the dev server.
-5. Sign up from the Account screen.
-
-Never put the Supabase service-role key in this frontend project.
-
-## Daily reminders
-
-V2 includes reminder settings and browser notifications while the app is available to the browser. Reliable push notifications when the site is fully closed require a push service / scheduled backend job; that is intentionally not faked in this build.
